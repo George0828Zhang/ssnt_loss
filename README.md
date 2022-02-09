@@ -1,7 +1,5 @@
 # ssnt-loss
 
-> :information_source: This is a WIP project. the implementation is still being tested.
-
 A pure PyTorch implementation of the loss described in *"Online Segment to Segment Neural Transduction"*  https://arxiv.org/abs/1609.08194.
 
 ## Usage
@@ -14,7 +12,7 @@ def ssnt_loss_mem(
     source_lengths: Tensor,
     target_lengths: Tensor,
     neg_inf: float = -1e4,
-    reduction="mean",
+    reduction="none",
 ):
     """The memory efficient implementation concatenates along the targets
     dimension to reduce wasted computation on padding positions.
@@ -101,9 +99,10 @@ print(loss.item())
 ```
 
 ## Note
-This implementation is based on the simplifying derivation proposed for monotonic attention, where they use parallelized `cumsum` and `cumprod` to compute the alignment. Based on the similarity of SSNT and monotonic attention, we can infer that the forward variable alpha(i,j) can be computed similarly.
-
-Feel free to contact me if there are bugs in the code.
+> :information_source: This is a WIP project. the implementation is still being tested.
+- This implementation is based on the simplifying derivation proposed for monotonic attention, where they use parallelized `cumsum` and `cumprod` to compute the alignment. Based on the similarity of SSNT and monotonic attention, we can infer that the forward variable alpha(i,j) can be computed similarly.
+- Run test by `python test.py` (requires `pip install expecttest`).
+- Feel free to contact me if there are bugs in the code.
 
 ## Reference
 - [Online Segment to Segment Neural Transduction](https://arxiv.org/abs/1609.08194)

@@ -122,6 +122,7 @@ def ssnt_loss(
     target_lengths: Tensor,
     neg_inf: float = -1e4,
     reduction="none",
+    return_lattice=False
 ):
     """The SNNT loss is very similar to monotonic attention,
     except taking word prediction probability p(y_j | h_i, s_j)
@@ -147,6 +148,8 @@ def ssnt_loss(
             Default: -1e4
         reduction (string, optional): Specifies reduction. suppoerts mean / sum.
             Default: None.
+        return_lattice (bool, optional): returns the log alpha scores. e.g. for debug.
+            Default: False.
     """
     prob_check(log_probs, neg_inf=neg_inf, logp=True)
     prob_check(log_p_choose, neg_inf=neg_inf, logp=True)
@@ -193,6 +196,9 @@ def ssnt_loss(
         )
         log_alpha[:, i + 1] = log_alpha_i
 
+    if return_lattice:
+        return log_alpha[:, 1:]
+
     # alpha: bsz, 1 + tgt_len, src_len
     # seq-loss: alpha(J, I)
     # pick source endpoints
@@ -223,7 +229,7 @@ def ssnt_loss_mem(
     source_lengths: Tensor,
     target_lengths: Tensor,
     neg_inf: float = -1e4,
-    reduction="mean",
+    reduction="none",
 ):
     """The memory efficient implementation concatenates along the targets
     dimension to reduce wasted computation on padding positions.
