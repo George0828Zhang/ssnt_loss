@@ -10,14 +10,6 @@ def lengths_to_padding_mask(lens):
     return mask
 
 
-def log1mexp(x):
-    # Computes log(1-exp(x)) assuming x is all negative
-    # See https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
-    _x = x.float()
-    out = torch.where(_x > -0.693, torch.log(-torch.expm1(_x)), torch.log1p(-torch.exp(_x)))
-    return out.type_as(x)
-
-
 def log_exclusive_cumprod(tensor, dim: int):
     """
     Implementing exclusive cumprod in log space (assume tensor is in log space)
@@ -33,7 +25,7 @@ def exclusive_cumsum(tensor, dim: int):
     return tensor
 
 
-def prob_check(tensor, eps=1e-10, neg_inf=-1e8, logp=True):
+def prob_check(tensor, eps=1e-10, neg_inf=-1e8, logp=False):
     assert not torch.isnan(tensor).any(), (
         "Nan in a probability tensor."
     )
@@ -50,109 +42,54 @@ def prob_check(tensor, eps=1e-10, neg_inf=-1e8, logp=True):
         )
 
 
-def expected_alignment_from_log_p_choose(
-    log_p_choose: Tensor,
-    padding_mask: Optional[Tensor] = None,
-    neg_inf: float = -1e4
-):
-    """
-    Calculating expected alignment for from stepwise probability
-    Assuming p_choose is given in log space (output from torch.log_sigmoid)
-    Reference:
-    Online and Linear-Time Attention by Enforcing Monotonic Alignments
-    https://arxiv.org/pdf/1704.00784.pdf
-    q_ij = (1 − p_{ij−1})q_{ij−1} + a+{i−1j}
-    a_ij = p_ij q_ij
-    Parallel solution:
-    ai = p_i * cumprod(1 − pi) * cumsum(a_i / cumprod(1 − pi))
-    ============================================================
-    Expected input size
-    p_choose: bsz, tgt_len, src_len
-    """
-    prob_check(log_p_choose, neg_inf=neg_inf, logp=True)
-
-    # p_choose: bsz, tgt_len, src_len
-    bsz, tgt_len, src_len = log_p_choose.size()
-    dtype = log_p_choose.dtype
-    log_p_choose = log_p_choose.float()
-
-    if padding_mask is not None:
-        log_p_choose = log_p_choose.masked_fill(padding_mask.unsqueeze(1), neg_inf)
-
-    def clamp_logp(x, min=neg_inf, max=0):
-        return x.clamp(min=min, max=max)
-
-    # cumprod_1mp : bsz, tgt_len, src_len
-    log_cumprod_1mp = log_exclusive_cumprod(
-        log1mexp(log_p_choose), dim=2)
-
-    log_alpha = log_p_choose.new_zeros([bsz, 1 + tgt_len, src_len])
-    log_alpha[:, 0, 1:] = neg_inf
-
-    for i in range(tgt_len):
-        # p_choose: bsz , tgt_len, src_len
-        # cumprod_1mp_clamp : bsz, tgt_len, src_len
-        # previous_alpha[i]: bsz, src_len
-        # alpha_i: bsz, src_len
-        log_alpha_i = clamp_logp(
-            log_p_choose[:, i]
-            + log_cumprod_1mp[:, i]
-            + torch.logcumsumexp(
-                log_alpha[:, i] - log_cumprod_1mp[:, i], dim=1
-            )
-        )
-        log_alpha[:, i + 1] = log_alpha_i
-
-    # alpha: bsz, tgt_len, src_len
-    log_alpha = log_alpha[:, 1:, :]
-
-    # Mix precision to prevent overflow for fp16
-    log_alpha = log_alpha.type(dtype)
-
-    prob_check(log_alpha, neg_inf=neg_inf, logp=True)
-
-    return log_alpha
-
-
 def ssnt_loss(
     log_probs: Tensor,
     targets: Tensor,
-    log_p_choose: Tensor,
     source_lengths: Tensor,
     target_lengths: Tensor,
+    emit_logits: Optional[Tensor] = None,
+    emit_probs: Optional[Tensor] = None,
     neg_inf: float = -1e4,
     reduction="none",
-    return_lattice=False
+    return_lattice=False,
+    fastemit_lambda=0
 ):
     """The SNNT loss is very similar to monotonic attention,
     except taking word prediction probability p(y_j | h_i, s_j)
     into account.
 
+    N is the minibatch size
+    T is the maximum number of output labels
+    S is the maximum number of input frames
+    V is the vocabulary of labels.
+
     Args:
-        log_probs (Tensor): Word prediction log-probs, should be output of log_softmax.
-            tensor with shape (N, T, S, V)
-            where N is the minibatch size, T is the maximum number of
-            output labels, S is the maximum number of input frames and V is
-            the vocabulary of labels.
-        targets (Tensor): Tensor with shape (N, T) representing the
-            reference target labels for all samples in the minibatch.
-        log_p_choose (Tensor): emission log-probs, should be output of F.logsigmoid.
-            tensor with shape (N, T, S)
-            where N is the minibatch size, T is the maximum number of
-            output labels, S is the maximum number of input frames.
-        source_lengths (Tensor): Tensor with shape (N,) representing the
-            number of frames for each sample in the minibatch.
-        target_lengths (Tensor): Tensor with shape (N,) representing the
-            length of the transcription for each sample in the minibatch.
+        log_probs (Tensor): (N, T, S, V) Word prediction log-probs, should be output of log_softmax.
+        targets (Tensor): (N, T) target labels for all samples in the minibatch.
+        source_lengths (Tensor): (N,) Length of the source frames for each sample in the minibatch.
+        target_lengths (Tensor): (N,) Length of the target labels for each sample in the minibatch.
+        emit_logits, emit_probs (Tensor, optional): (N, T, S) Emission logits (before sigmoid) or
+            probs (after sigmoid). If both are provided, logits is used.
         neg_inf (float, optional): The constant representing -inf used for masking.
             Default: -1e4
         reduction (string, optional): Specifies reduction. suppoerts mean / sum.
             Default: None.
-        return_lattice (bool, optional): returns the log alpha scores. e.g. for debug.
+        return_lattice (bool, optional): Returns the log alpha scores. e.g. for debug.
             Default: False.
+        fastemit_lambda (float, optional): Scale the emission gradient of emission paths to
+            encourage low latency. https://arxiv.org/pdf/2010.11148.pdf
+            Default: 0
     """
     prob_check(log_probs, neg_inf=neg_inf, logp=True)
-    prob_check(log_p_choose, neg_inf=neg_inf, logp=True)
+
+    if emit_logits is None:
+        assert emit_probs is not None, "emit_probs and emit_logits cannot both be None."
+        prob_check(emit_probs)
+        log_p_choose = torch.log(emit_probs)
+        log_1mp = torch.log1p(-emit_probs)
+    else:
+        log_p_choose = torch.nn.functional.logsigmoid(emit_logits)
+        log_1mp = torch.nn.functional.logsigmoid(-emit_logits)
 
     # p_choose: bsz, tgt_len, src_len
     bsz, tgt_len, src_len = log_p_choose.size()
@@ -167,12 +104,12 @@ def ssnt_loss(
         return x.clamp(min=min, max=max)
 
     # cumprod_1mp : bsz, tgt_len, src_len
-    log_cumprod_1mp = log_exclusive_cumprod(
-        log1mexp(log_p_choose), dim=2)
+    log_cumprod_1mp = log_exclusive_cumprod(log_1mp, dim=-1)
 
     log_alpha = log_p_choose.new_zeros([bsz, 1 + tgt_len, src_len])
     log_alpha[:, 0, 1:] = neg_inf
 
+    fastemit_const = torch.tensor([fastemit_lambda]).log1p().type_as(log_alpha)
     for i in range(tgt_len):
         # log_probs:    bsz, tgt_len, src_len, vocab
         # p_choose:     bsz, tgt_len, src_len
@@ -191,7 +128,7 @@ def ssnt_loss(
             + log_p_choose[:, i]
             + log_cumprod_1mp[:, i]
             + torch.logcumsumexp(
-                log_alpha[:, i] - log_cumprod_1mp[:, i], dim=1
+                fastemit_const + log_alpha[:, i] - log_cumprod_1mp[:, i], dim=1
             )
         )
         log_alpha[:, i + 1] = log_alpha_i
@@ -225,47 +162,54 @@ def ssnt_loss(
 def ssnt_loss_mem(
     log_probs: Tensor,
     targets: Tensor,
-    log_p_choose: Tensor,
     source_lengths: Tensor,
     target_lengths: Tensor,
+    emit_logits: Optional[Tensor] = None,
+    emit_probs: Optional[Tensor] = None,
     neg_inf: float = -1e4,
     reduction="none",
+    fastemit_lambda=0
 ):
     """The memory efficient implementation concatenates along the targets
     dimension to reduce wasted computation on padding positions.
 
-    Assuming the summation of all targets in the batch is T_flat, then
-    the original B x T x ... tensor is reduced to T_flat x ...
+    N is the minibatch size
+    T is the maximum number of output labels
+    S is the maximum number of input frames
+    V is the vocabulary of labels.
+    T_flat is the summation of lengths of all output labels
 
-    The input tensors can be obtained by using target mask:
-    Example:
+    Assuming the original tensor is of (N, T, ...), then it should be reduced to
+    (T_flat, ...). This can be obtained by using a target mask.
+    For example:
         >>> target_mask = targets.ne(pad)   # (B, T)
         >>> targets = targets[target_mask]  # (T_flat,)
         >>> log_probs = log_probs[target_mask]  # (T_flat, S, V)
 
     Args:
-        log_probs (Tensor): Word prediction log-probs, should be output of log_softmax.
-            tensor with shape (T_flat, S, V)
-            where T_flat is the summation of all target lengths,
-            S is the maximum number of input frames and V is
-            the vocabulary of labels.
-        targets (Tensor): Tensor with shape (T_flat,) representing the
-            reference target labels for all samples in the minibatch.
-        log_p_choose (Tensor): emission log-probs, should be output of F.logsigmoid.
-            tensor with shape (T_flat, S)
-            where T_flat is the summation of all target lengths,
-            S is the maximum number of input frames.
-        source_lengths (Tensor): Tensor with shape (N,) representing the
-            number of frames for each sample in the minibatch.
-        target_lengths (Tensor): Tensor with shape (N,) representing the
-            length of the transcription for each sample in the minibatch.
+        log_probs (Tensor): (T_flat, S, V) Word prediction log-probs, should be output of log_softmax.
+        targets (Tensor): (T_flat,) target labels for all samples in the minibatch.
+        source_lengths (Tensor): (N,) Length of the source frames for each sample in the minibatch.
+        target_lengths (Tensor): (N,) Length of the target labels for each sample in the minibatch.
+        emit_logits, emit_probs (Tensor, optional): (T_flat, S) Emission logits (before sigmoid) or
+            probs (after sigmoid). If both are provided, logits is used.
         neg_inf (float, optional): The constant representing -inf used for masking.
             Default: -1e4
         reduction (string, optional): Specifies reduction. suppoerts mean / sum.
             Default: None.
+        fastemit_lambda (float, optional): Scale the emission gradient of emission paths to
+            encourage low latency. https://arxiv.org/pdf/2010.11148.pdf
+            Default: 0
     """
     prob_check(log_probs, neg_inf=neg_inf, logp=True)
-    prob_check(log_p_choose, neg_inf=neg_inf, logp=True)
+    if emit_logits is None:
+        assert emit_probs is not None, "emit_probs and emit_logits cannot both be None."
+        prob_check(emit_probs)
+        log_p_choose = torch.log(emit_probs)
+        log_1mp = torch.log1p(-emit_probs)
+    else:
+        log_p_choose = torch.nn.functional.logsigmoid(emit_logits)
+        log_1mp = torch.nn.functional.logsigmoid(-emit_logits)
 
     bsz = source_lengths.size(0)
     tgt_len_flat, src_len = log_p_choose.size()
@@ -281,14 +225,14 @@ def ssnt_loss_mem(
         return x.clamp(min=min, max=max)
 
     # cumprod_1mp : tgt_len_flat, src_len
-    log_cumprod_1mp = log_exclusive_cumprod(
-        log1mexp(log_p_choose), dim=-1)
+    log_cumprod_1mp = log_exclusive_cumprod(log_1mp, dim=-1)
 
     log_alpha = log_p_choose.new_zeros([tgt_len_flat + bsz, src_len])
     offsets = exclusive_cumsum(target_lengths, dim=0)
     offsets_out = exclusive_cumsum(target_lengths + 1, dim=0)
     log_alpha[offsets_out, 1:] = neg_inf
 
+    fastemit_const = torch.tensor([fastemit_lambda]).log1p().type_as(log_alpha)
     for i in range(target_lengths.max()):
         # log_probs:    tgt_len_flat, src_len, vocab
         # p_choose:     tgt_len_flat, src_len
@@ -312,7 +256,7 @@ def ssnt_loss_mem(
             + log_p_choose[indices]
             + log_cumprod_1mp[indices]
             + torch.logcumsumexp(
-                log_alpha[indices_out] - log_cumprod_1mp[indices], dim=1
+                fastemit_const + log_alpha[indices_out] - log_cumprod_1mp[indices], dim=1
             )
         )
         log_alpha[indices_out + 1] = log_alpha_i

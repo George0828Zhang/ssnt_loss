@@ -1,12 +1,10 @@
 import unittest
 import torch
 import numpy as np
-import torch.nn.functional as F
 from ssnt_loss import (
     ssnt_loss,
     ssnt_loss_mem,
-    log_exclusive_cumprod,
-    log1mexp,
+    exclusive_cumsum,
     lengths_to_padding_mask
 )
 
@@ -22,18 +20,20 @@ class SSNTLossTest(TestCase):
         self,
         log_probs,
         targets,
-        log_p_choose,
         source_lengths,
         target_lengths,
+        emit_probs,
         neg_inf: float = -1e4,
         reduction="none",
-        return_lattice=False
+        return_lattice=False,
     ):
         """ raw array test """
+        log_p_choose = torch.log(emit_probs)
+        log_1mp = torch.log1p(-emit_probs)
+
         bsz, tgt_len, src_len = log_p_choose.size()
 
-        logcumprod_1mp = log_exclusive_cumprod(
-            log1mexp(log_p_choose), dim=-1)
+        logcumprod_1mp = exclusive_cumsum(log_1mp, dim=-1)
 
         source_padding_mask = lengths_to_padding_mask(source_lengths)
         if source_padding_mask.any():
@@ -107,64 +107,112 @@ class SSNTLossTest(TestCase):
 
         # inputs
         lattice = torch.rand(B, T, S, V, device=device).log_softmax(-1)
-        log_emit = F.logsigmoid(torch.rand(B, T, S, device=device))
+        emit_logits = torch.rand(B, T, S, device=device)
         targets = torch.randint(0, V, (B, T), device=device)
         source_lengths = torch.full((B,), S, device=device)
         target_lengths = torch.full((B,), T, device=device)
 
-        inputs = {
-            "log_probs": lattice,
-            "targets": targets,
-            "log_p_choose": log_emit,
-            "source_lengths": source_lengths,
-            "target_lengths": target_lengths,
-            "return_lattice": True
-        }
+        # reference
+        y = self._test_ssnt_loss_ref(
+            lattice,
+            targets,
+            source_lengths,
+            target_lengths,
+            emit_probs=emit_logits.sigmoid(),
+            return_lattice=True
+        ).cpu().detach().numpy()
 
-        # test normal ver
-        y = self._test_ssnt_loss_ref(**inputs).cpu().detach().numpy()
-        x = self._test_custom_ssnt_loss_impl(**inputs).cpu().detach().numpy()
+        # test normal ver (logits)
+        x1 = self._test_custom_ssnt_loss_impl(
+            lattice,
+            targets,
+            source_lengths,
+            target_lengths,
+            emit_logits=emit_logits,
+            return_lattice=True
+        ).cpu().detach().numpy()
         np.testing.assert_allclose(
-            x,
+            x1,
+            y,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+        # test normal ver (probs)
+        x2 = self._test_custom_ssnt_loss_impl(
+            lattice,
+            targets,
+            source_lengths,
+            target_lengths,
+            emit_probs=emit_logits.sigmoid(),
+            return_lattice=True
+        ).cpu().detach().numpy()
+        np.testing.assert_allclose(
+            x2,
             y,
             atol=1e-3,
             rtol=1e-3,
         )
 
         # compare loss
-        inputs = {
-            "log_probs": lattice,
-            "targets": targets,
-            "log_p_choose": log_emit,
-            "source_lengths": source_lengths,
-            "target_lengths": target_lengths,
-            "reduction": "none"
-        }
+        # reference
+        y = self._test_ssnt_loss_ref(
+            lattice,
+            targets,
+            source_lengths,
+            target_lengths,
+            emit_probs=emit_logits.sigmoid(),
+            reduction="none"
+        ).cpu().detach().numpy()
 
         # test normal ver
-        y = self._test_ssnt_loss_ref(**inputs).cpu().detach().numpy()
-        x = self._test_custom_ssnt_loss_impl(**inputs).cpu().detach().numpy()
+        x1 = self._test_custom_ssnt_loss_impl(
+            lattice,
+            targets,
+            source_lengths,
+            target_lengths,
+            emit_logits=emit_logits,
+            reduction="none"
+        ).cpu().detach().numpy()
         np.testing.assert_allclose(
-            x,
-            y,
-            atol=1e-3,
-            rtol=1e-3,
-        )
-        # test mem ver
-        self.convert_mem(inputs, target_lengths)
-        z = self._test_custom_ssnt_loss_mem_impl(**inputs).cpu().detach().numpy()
-        np.testing.assert_allclose(
-            z,
+            x1,
             y,
             atol=1e-3,
             rtol=1e-3,
         )
 
-    def convert_mem(self, inputs, target_lengths):
+        # test mem ver (logits)
         mask = ~lengths_to_padding_mask(target_lengths)
-        for k in "log_probs", "targets", "log_p_choose":
-            inputs[k] = inputs[k][mask]
-        return inputs, mask
+        z1 = self._test_custom_ssnt_loss_mem_impl(
+            lattice[mask],
+            targets[mask],
+            source_lengths,
+            target_lengths,
+            emit_logits=emit_logits[mask],
+            reduction="none"
+        ).cpu().detach().numpy()
+        np.testing.assert_allclose(
+            z1,
+            y,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+        # test mem ver (probs)
+        z2 = self._test_custom_ssnt_loss_mem_impl(
+            lattice[mask],
+            targets[mask],
+            source_lengths,
+            target_lengths,
+            emit_probs=emit_logits[mask].sigmoid(),
+            reduction="none"
+        ).cpu().detach().numpy()
+        np.testing.assert_allclose(
+            z2,
+            y,
+            atol=1e-3,
+            rtol=1e-3,
+        )
 
 
 if __name__ == "__main__":
