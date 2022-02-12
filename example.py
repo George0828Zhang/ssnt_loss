@@ -36,7 +36,7 @@ if __name__ == "__main__":
     targets = targets[mask]
 
     # normal ssnt loss
-    loss = ssnt_loss_mem(
+    loss, _, _ = ssnt_loss_mem(
         logp,
         targets,
         source_lengths=source_lengths,

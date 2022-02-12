@@ -51,7 +51,6 @@ def ssnt_loss(
     emit_probs: Optional[Tensor] = None,
     neg_inf: float = -1e4,
     reduction="none",
-    return_lattice=False,
     fastemit_lambda=0
 ):
     """The SNNT loss is very similar to monotonic attention,
@@ -74,8 +73,6 @@ def ssnt_loss(
             Default: -1e4
         reduction (string, optional): Specifies reduction. suppoerts mean / sum.
             Default: None.
-        return_lattice (bool, optional): Returns the log alpha scores. e.g. for debug.
-            Default: False.
         fastemit_lambda (float, optional): Scale the emission gradient of emission paths to
             encourage low latency. https://arxiv.org/pdf/2010.11148.pdf
             Default: 0
@@ -109,32 +106,27 @@ def ssnt_loss(
     log_alpha = log_p_choose.new_zeros([bsz, 1 + tgt_len, src_len])
     log_alpha[:, 0, 1:] = neg_inf
 
+    # We can compute the 'prefix' with 3 kernel launches:
+    # prefix = p_trans * p_choose * cumprod_1mp
+    # log_probs:
+    #   bsz, tgt_len, src_len, vocab
+    # p_trans, p_choose, cumprod_1mp:
+    #   bsz, tgt_len, src_len
+    logp_trans = log_probs.gather(
+        dim=-1,
+        index=targets.view(bsz, tgt_len, 1, 1).expand(-1, -1, src_len, -1)
+    ).squeeze(-1)
+    logp_prefix = logp_trans + log_p_choose + log_cumprod_1mp
     fastemit_const = torch.tensor([fastemit_lambda]).log1p().type_as(log_alpha)
     for i in range(tgt_len):
-        # log_probs:    bsz, tgt_len, src_len, vocab
-        # p_choose:     bsz, tgt_len, src_len
-        # cumprod_1mp:  bsz, tgt_len, src_len
         # alpha[i]:     bsz, src_len
-
-        # get p(y_i | h_*, s_i) -> bsz, src_len
-        # log_probs[:,i]:   bsz, src_len, vocab
-        # targets[:,i]:     bsz,
-        logp_trans = log_probs[:, i].gather(
-            dim=-1,
-            index=targets[:, i].view(bsz, 1, 1).expand(-1, src_len, -1)
-        ).squeeze(-1)
-        log_alpha_i = clamp_logp(
-            logp_trans
-            + log_p_choose[:, i]
-            + log_cumprod_1mp[:, i]
-            + torch.logcumsumexp(
+        log_alpha[:, i + 1] = clamp_logp(
+            logp_prefix[:, i] + torch.logcumsumexp(
                 fastemit_const + log_alpha[:, i] - log_cumprod_1mp[:, i], dim=1
             )
         )
-        log_alpha[:, i + 1] = log_alpha_i
 
-    if return_lattice:
-        return log_alpha[:, 1:]
+    lattice = log_alpha[:, 1:]
 
     # alpha: bsz, 1 + tgt_len, src_len
     # seq-loss: alpha(J, I)
@@ -156,7 +148,7 @@ def ssnt_loss(
     elif reduction == "mean":
         log_alpha = log_alpha.mean()
 
-    return -log_alpha
+    return -log_alpha, lattice, log_p_choose
 
 
 def ssnt_loss_mem(
@@ -232,34 +224,32 @@ def ssnt_loss_mem(
     offsets_out = exclusive_cumsum(target_lengths + 1, dim=0)
     log_alpha[offsets_out, 1:] = neg_inf
 
+    # We can compute the 'prefix' with 3 kernel launches:
+    # prefix = p_trans * p_choose * cumprod_1mp
+    # log_probs:
+    #   tgt_len_flat, src_len, vocab
+    # p_trans, p_choose, cumprod_1mp:
+    #   tgt_len_flat, src_len
+    logp_trans = (
+        log_probs
+        .gather(-1, index=targets.view(tgt_len_flat, 1, 1).expand(-1, src_len, -1))
+    ).squeeze(-1)
+    logp_prefix = logp_trans + log_p_choose + log_cumprod_1mp
     fastemit_const = torch.tensor([fastemit_lambda]).log1p().type_as(log_alpha)
     for i in range(target_lengths.max()):
-        # log_probs:    tgt_len_flat, src_len, vocab
-        # p_choose:     tgt_len_flat, src_len
-        # cumprod_1mp:  tgt_len_flat, src_len
-
         # operate on fake bsz (aka indices.size(0) below)
-        # get p(y_i | h_*, s_i) -> bsz, src_len
-        # log_probs[indices]:   bsz, src_len, vocab
-        # targets[indices]:     bsz,
+        msk = i < target_lengths
+        indices = (offsets + i)[msk]
+        indices_out = (offsets_out + i)[msk]
 
-        indices = (offsets + i)[i < target_lengths]
-        indices_out = (offsets_out + i)[i < target_lengths]
-        fake_bsz = indices.numel()
-
-        logp_trans = (
-            log_probs[indices]
-            .gather(-1, index=targets[indices].view(fake_bsz, 1, 1).expand(-1, src_len, -1))
-        ).squeeze(-1)
-        log_alpha_i = clamp_logp(
-            logp_trans
-            + log_p_choose[indices]
-            + log_cumprod_1mp[indices]
-            + torch.logcumsumexp(
+        log_alpha[indices_out + 1] = clamp_logp(
+            logp_prefix[indices] + torch.logcumsumexp(
                 fastemit_const + log_alpha[indices_out] - log_cumprod_1mp[indices], dim=1
             )
         )
-        log_alpha[indices_out + 1] = log_alpha_i
+
+    # too lazy to remove the 'bsz' extra buffers.
+    lattice = log_alpha
 
     # alpha: tgt_len_flat + bsz, src_len
     # seq-loss: alpha(J, I)
@@ -278,4 +268,4 @@ def ssnt_loss_mem(
     elif reduction == "mean":
         log_alpha = log_alpha.mean()
 
-    return -log_alpha
+    return -log_alpha, lattice, log_p_choose

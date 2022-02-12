@@ -25,7 +25,6 @@ class SSNTLossTest(TestCase):
         emit_probs,
         neg_inf: float = -1e4,
         reduction="none",
-        return_lattice=False,
     ):
         """ raw array test """
         log_p_choose = torch.log(emit_probs)
@@ -73,15 +72,12 @@ class SSNTLossTest(TestCase):
 
             output[t] = log_alpha[t, target_lengths[t] - 1, source_lengths[t] - 1]
 
-        if return_lattice:
-            return log_alpha
-
         if reduction == "sum":
             output = output.sum()
         elif reduction == "mean":
             output = output.mean()
 
-        return -output
+        return -output, log_alpha, log_p_choose
 
     def _test_custom_ssnt_loss_impl(
         self, *args, **kwargs
@@ -113,103 +109,90 @@ class SSNTLossTest(TestCase):
         target_lengths = torch.full((B,), T, device=device)
 
         # reference
-        y = self._test_ssnt_loss_ref(
+        y, lat_y, _ = self._test_ssnt_loss_ref(
             lattice,
             targets,
             source_lengths,
             target_lengths,
             emit_probs=emit_logits.sigmoid(),
-            return_lattice=True
-        ).cpu().detach().numpy()
+            reduction="none"
+        )
 
         # test normal ver (logits)
-        x1 = self._test_custom_ssnt_loss_impl(
+        x1, lat_x1, _ = self._test_custom_ssnt_loss_impl(
             lattice,
             targets,
             source_lengths,
             target_lengths,
             emit_logits=emit_logits,
-            return_lattice=True
-        ).cpu().detach().numpy()
+            reduction="none"
+        )
         np.testing.assert_allclose(
-            x1,
-            y,
+            lat_x1.cpu().detach().numpy(),
+            lat_y.cpu().detach().numpy(),
             atol=1e-3,
             rtol=1e-3,
         )
 
         # test normal ver (probs)
-        x2 = self._test_custom_ssnt_loss_impl(
+        x2, lat_x2, _ = self._test_custom_ssnt_loss_impl(
             lattice,
             targets,
             source_lengths,
             target_lengths,
             emit_probs=emit_logits.sigmoid(),
-            return_lattice=True
-        ).cpu().detach().numpy()
+            reduction="none"
+        )
         np.testing.assert_allclose(
-            x2,
-            y,
+            lat_x2.cpu().detach().numpy(),
+            lat_y.cpu().detach().numpy(),
             atol=1e-3,
             rtol=1e-3,
         )
 
         # compare loss
-        # reference
-        y = self._test_ssnt_loss_ref(
-            lattice,
-            targets,
-            source_lengths,
-            target_lengths,
-            emit_probs=emit_logits.sigmoid(),
-            reduction="none"
-        ).cpu().detach().numpy()
-
-        # test normal ver
-        x1 = self._test_custom_ssnt_loss_impl(
-            lattice,
-            targets,
-            source_lengths,
-            target_lengths,
-            emit_logits=emit_logits,
-            reduction="none"
-        ).cpu().detach().numpy()
         np.testing.assert_allclose(
-            x1,
-            y,
+            x1.cpu().detach().numpy(),
+            y.cpu().detach().numpy(),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        np.testing.assert_allclose(
+            x2.cpu().detach().numpy(),
+            y.cpu().detach().numpy(),
             atol=1e-3,
             rtol=1e-3,
         )
 
         # test mem ver (logits)
         mask = ~lengths_to_padding_mask(target_lengths)
-        z1 = self._test_custom_ssnt_loss_mem_impl(
+        z1, _, _ = self._test_custom_ssnt_loss_mem_impl(
             lattice[mask],
             targets[mask],
             source_lengths,
             target_lengths,
             emit_logits=emit_logits[mask],
             reduction="none"
-        ).cpu().detach().numpy()
+        )
         np.testing.assert_allclose(
-            z1,
-            y,
+            z1.cpu().detach().numpy(),
+            y.cpu().detach().numpy(),
             atol=1e-3,
             rtol=1e-3,
         )
 
         # test mem ver (probs)
-        z2 = self._test_custom_ssnt_loss_mem_impl(
+        z2, _, _ = self._test_custom_ssnt_loss_mem_impl(
             lattice[mask],
             targets[mask],
             source_lengths,
             target_lengths,
             emit_probs=emit_logits[mask].sigmoid(),
             reduction="none"
-        ).cpu().detach().numpy()
+        )
         np.testing.assert_allclose(
-            z2,
-            y,
+            z2.cpu().detach().numpy(),
+            y.cpu().detach().numpy(),
             atol=1e-3,
             rtol=1e-3,
         )
